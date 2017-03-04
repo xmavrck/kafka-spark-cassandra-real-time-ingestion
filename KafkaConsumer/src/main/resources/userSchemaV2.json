@@ -1,0 +1,22 @@
+{
+  "fields": [
+    {
+      "name": "firstname",
+      "type": "string"
+    },
+    {
+      "name": "lastname",
+      "type": "string"
+    },
+    {
+      "name": "phonenumber",
+      "type": "long"
+    },
+    {
+      "name": "address",
+      "type": "string"
+    }
+  ],
+  "name": "user_infov2",
+  "type": "record"
+}
