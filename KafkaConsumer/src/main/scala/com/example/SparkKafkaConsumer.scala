@@ -30,8 +30,8 @@ import org.apache.spark.streaming.dstream.InputDStream
 case class Event(event_timestamp: Long, firstname: String, lastname: String, phonenumber: Long, address: String)
 object SparkKafkaConsumer extends Serializable {
 
-  val VERSION_1 = 1;
-  val VERSION_2 = 2;
+  var avroSchemaVer1 = ""
+  var avroSchemaVer2 = ""
   /*
   * Entry point of our application
   * */
@@ -40,7 +40,7 @@ object SparkKafkaConsumer extends Serializable {
       println("Please set POC_SCALA_CONSUMER_CONFIG environment variable which should point to your config.properties file")
       System.exit(1)
     }
-    val (topicV1, topicV2, brokerHost, cassandraHost, database, tableEvent, tableAggEvent, csvOutput, avroSchemaPathV1, avroSchemaPathV2, sparkAppName, sparkCheckpointDir) =
+    val (topics, brokerHost, cassandraHost, database, tableEvent, tableAggEvent, csvOutput, avroSchemaPathV1, avroSchemaPathV2, sparkAppName, sparkCheckpointDir) =
       try {
         val prop = new Properties()
         // Load a properties file config.properties from project classpath, and retrieved the property value.
@@ -59,62 +59,52 @@ object SparkKafkaConsumer extends Serializable {
         //    * @sparkAppName return name of the spark app
         //    * @sparkCheckpointDir return the checkpoint directory which stores kafka offsets
         //    */
-        (prop.getProperty("kafka.topic.version1"), prop.getProperty("kafka.topic.version2"), prop.getProperty("kafka.broker.host"), prop.getProperty("cassandra.connection.host"), prop.getProperty("cassandra.keyspace"), prop.getProperty("cassandra.table.event"), prop.getProperty("cassandra.table.event.aggregation"), prop.getProperty("aggregation.csv.outputpath"), prop.getProperty("schema.path"), prop.getProperty("schemav2.path"), prop.getProperty("spark.app.name"), prop.getProperty("spark.checkpoint.directory"))
+        (prop.getProperty("kafka.topics"), prop.getProperty("kafka.broker.host"), prop.getProperty("cassandra.connection.host"), prop.getProperty("cassandra.keyspace"), prop.getProperty("cassandra.table.event"), prop.getProperty("cassandra.table.event.aggregation"), prop.getProperty("aggregation.csv.outputpath"), prop.getProperty("schema.path"), prop.getProperty("schemav2.path"), prop.getProperty("spark.app.name"), prop.getProperty("spark.checkpoint.directory"))
       } catch { case e: Exception => e.printStackTrace(); sys.exit(1); }
+    // creating avroschema objects from schema file    
+    val schemaFileVer1 = scala.io.Source.fromFile(avroSchemaPathV1)
+    avroSchemaVer1 = try schemaFileVer1.mkString finally schemaFileVer1.close()
+
+    val schemaFileVer2 = scala.io.Source.fromFile(avroSchemaPathV2)
+    avroSchemaVer2 = try schemaFileVer2.mkString finally schemaFileVer2.close()
+
     // starting spark streaming context
-    val ssc = StreamingContext.getOrCreate(sparkCheckpointDir, () => createContext(topicV1, topicV2, brokerHost, cassandraHost, database, tableEvent, tableAggEvent, csvOutput, avroSchemaPathV1, avroSchemaPathV2, sparkAppName, sparkCheckpointDir)); ssc.start(); ssc.awaitTermination(); ssc.stop(true, true);
+    val ssc = StreamingContext.getOrCreate(sparkCheckpointDir, () => createContext(topics, brokerHost, cassandraHost, database, tableEvent, tableAggEvent, csvOutput, sparkAppName, sparkCheckpointDir)); ssc.start(); ssc.awaitTermination(); ssc.stop(true, true);
   }
-  def createContext(topicV1: String, topicV2: String, brokerHost: String, cassandraHost: String, database: String, tableEvent: String, tableAggEvent: String, csvOutput: String, avroSchemaPathV1: String, avroSchemaPathV2: String, sparkAppName: String, sparkCheckpointDir: String): StreamingContext = {
+  def createContext(topics: String, brokerHost: String, cassandraHost: String, database: String, tableEvent: String, tableAggEvent: String, csvOutput: String, sparkAppName: String, sparkCheckpointDir: String): StreamingContext = {
     //  SparkConf object that contains information about your application
     val conf: SparkConf = new SparkConf().setAppName(sparkAppName).setMaster("local[1]")
-      .set("spark.cassandra.connection.host", cassandraHost)
+	.set("spark.cassandra.connection.host", cassandraHost)
     //  The maximum total size of the batch in bytes.
     conf.set("spark.cassandra.output.batch.size.rows", "auto")
     // maximum concurrent writes in a spark job
     conf.set("spark.cassandra.output.concurrent.writes", "10")
     // Number of bytes per single batch
     conf.set("spark.cassandra.output.batch.size.bytes", "100000")
-    // reading from two kafka streams parallely , we are increasing our spark concurrent jobs
-    conf.set("spark.streaming.concurrentJobs", "2")
     // writing headers to our csv results file
     writeHeaders(csvOutput)
     /// create  a local StreamingContext with batch interval of 1 second
     val sc = new SparkContext(conf)
+    // adding a interval of 5 seconds
     val ssc = new StreamingContext(sc, Seconds(5));
     ssc.remember(Seconds(60 * 2));
     ssc.checkpoint(sparkCheckpointDir);
 
     // two kafka direct stream to read the data from two topics in parallel by spark job
-    val kafkaStreamVer1 = KafkaUtils.createDirectStream[String, Array[Byte], StringDecoder, DefaultDecoder](ssc, Map[String, String]("metadata.broker.list" -> brokerHost), topicV1.split(",").toSet)
-    val kafkaStreamVer2 = KafkaUtils.createDirectStream[String, Array[Byte], StringDecoder, DefaultDecoder](ssc, Map[String, String]("metadata.broker.list" -> brokerHost), topicV2.split(",").toSet)
+    val kafkaStream = KafkaUtils.createDirectStream[String, Array[Byte], StringDecoder, DefaultDecoder](ssc, Map[String, String]("metadata.broker.list" -> brokerHost), topics.split(",").toSet)
 
-    // this is aggregated stream to read from both topics
-    // earlier we have joined the streams, but that was missing messages from version 2 avro schema,
-    // so till we are resolving the issue, we are just creating a consumer to read from two topics directly
-    //    val aggStream = KafkaUtils.createDirectStream[String, Array[Byte], StringDecoder, DefaultDecoder](ssc, Map[String, String]("metadata.broker.list" -> brokerHost), (topicV1 + topicV2).split(",").toSet)
-
-    // simply reading from kafka stream version 1
-    var dStreamV1 = kafkaStreamVer1.map {
+    // simply reading from kafka stream version
+    var dStream = kafkaStream.map {
       case (_, msg) =>
         // getting avro record on the basis of schema of msg
-        val record: GenericRecord = getRecord(msg, avroSchemaPathV1)
+        val record: GenericRecord = getRecord(msg)
         // generating rdd using GenericRecord
         // currentimestamp, firstname , lastname,phonenumber, address
         // address is N/A because in version 1 , we are not passing address
         Event(System.currentTimeMillis / 1000, record.get("firstname").toString, record.get("lastname").toString, record.get("phonenumber").toString.toLong, "N/A")
     }
-    saveToCassandra(dStreamV1, database, tableEvent);
-    saveAggregatesToCassandra(kafkaStreamVer1, database, tableAggEvent, avroSchemaPathV1, csvOutput);
-
-    // simply reading from kafka stream version 2
-    var dStreamV2 = kafkaStreamVer2.map {
-      case (_, msg) =>
-        // getting avro record on the basis of schema of msg
-        val record: GenericRecord = getRecord(msg, avroSchemaPathV2)
-        Event(System.currentTimeMillis / 1000, record.get("firstname").toString, record.get("lastname").toString, record.get("phonenumber").toString.toLong, record.get("address").toString)
-    }
-    saveToCassandra(dStreamV2, database, tableEvent);
-    saveAggregatesToCassandra(kafkaStreamVer2, database, tableAggEvent, avroSchemaPathV2, csvOutput);
+    saveToCassandra(dStream, database, tableEvent);
+    saveAggregatesToCassandra(kafkaStream, database, tableAggEvent, csvOutput);
 
     ssc
   }
@@ -124,11 +114,11 @@ object SparkKafkaConsumer extends Serializable {
         rdd.saveToCassandra(database, tableEvent, SomeColumns("event_timestamp", "firstname", "lastname", "phonenumber", "address"))
     })
   }
-  def saveAggregatesToCassandra(kafkaStream: InputDStream[(String, Array[Byte])], database: String, tableAggEvent: String, avroSchemaPath: String, csvOutputPath: String): Unit = {
+  def saveAggregatesToCassandra(kafkaStream: InputDStream[(String, Array[Byte])], database: String, tableAggEvent: String, csvOutputPath: String): Unit = {
     kafkaStream.map {
       case (_, msg) =>
         // getting avrorecord from msg
-        val record: GenericRecord = getRecord(msg, avroSchemaPath)
+        val record: GenericRecord = getRecord(msg)
         val firstname: String = record.get("firstname").toString
         // generating rdd key as first two letters of firstname , value as firstname
         (firstname.substring(0, 2): String, firstname: String)
@@ -151,10 +141,14 @@ object SparkKafkaConsumer extends Serializable {
   * @param  msg:Array[Byte]
   * @return GenericRecord
   * */
-  def getRecord(msg: Array[Byte], schemaPath: String): GenericRecord = {
-    val schemaFile = scala.io.Source.fromFile(schemaPath)
-    val avroSchema = try schemaFile.mkString finally schemaFile.close()
-    GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchema)).invert(msg).get
+  def getRecord(msg: Array[Byte]): GenericRecord = {
+    try
+      GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer1)).invert(msg).get
+    catch {
+      case e: Exception => {
+        GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer2)).invert(msg).get
+      }
+    }
   }
 
   /*
