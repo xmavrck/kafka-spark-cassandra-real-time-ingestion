@@ -131,7 +131,11 @@ object SparkKafkaConsumer extends Serializable {
         // aggregation results stored to cassandra
         rdd.saveToCassandra(database, tableAggEvent, SomeColumns("event_timestamp", "count", "names")))
   }
-
+/*
+  * used to get avro record from kafka msg
+  * @param  msg:Array[Byte]
+  * @return GenericRecord
+  * */
   def getAvroSchema(msg: Array[Byte]):GenericRecord={
    try
      GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer1)).invert(msg).get
@@ -142,9 +146,9 @@ object SparkKafkaConsumer extends Serializable {
 	}
   }
   /*
-  * used to generate avrorecord from kafka msg
+  * used to generate event from kafka msg
   * @param  msg:Array[Byte]
-  * @return GenericRecord
+  * @return Event
   * */
   def parseMessage(msg: Array[Byte]): Event = {
     try{
@@ -155,7 +159,12 @@ object SparkKafkaConsumer extends Serializable {
       }
     }
   }
-  
+   /*
+  * used to process message to check versions
+  * @param  hasAddress:Boolean
+  * @param  msg:Array[Byte]
+  * @return Event
+  * */
   def processMessage(hasAddress:Boolean,record: GenericRecord):Event={
      var address:String="N/A"
      if(hasAddress)
