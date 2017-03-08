@@ -46,8 +46,7 @@ object SparkKafkaConsumer extends Serializable {
         // Load a properties file config.properties from project classpath, and retrieved the property value.
         prop.load(new FileInputStream(System.getenv("POC_SCALA_CONSUMER_CONFIG")))
         // retrieved the property value
-        //    * @topicV1 return topic for version 1 avro message
-        //    * @topicV2 return topic for version 2 avro message
+        //    * @topics return topics 
         //    * @brokerHost return kafka broker server host and post no
         //    * @cassandraHost return cassandra host
         //    * @database return cassandra database name
@@ -96,12 +95,8 @@ object SparkKafkaConsumer extends Serializable {
     // simply reading from kafka stream version
     var dStream = kafkaStream.map {
       case (_, msg) =>
-        // getting avro record on the basis of schema of msg
-        val record: GenericRecord = getRecord(msg)
-        // generating rdd using GenericRecord
-        // currentimestamp, firstname , lastname,phonenumber, address
-        // address is N/A because in version 1 , we are not passing address
-        Event(System.currentTimeMillis / 1000, record.get("firstname").toString, record.get("lastname").toString, record.get("phonenumber").toString.toLong, "N/A")
+        // getting avro record on the basis of schema of msg & parsing it
+       parseMessage(msg)
     }
     saveToCassandra(dStream, database, tableEvent);
     saveAggregatesToCassandra(kafkaStream, database, tableAggEvent, csvOutput);
@@ -118,7 +113,7 @@ object SparkKafkaConsumer extends Serializable {
     kafkaStream.map {
       case (_, msg) =>
         // getting avrorecord from msg
-        val record: GenericRecord = getRecord(msg)
+        val record: GenericRecord = getAvroSchema(msg)
         val firstname: String = record.get("firstname").toString
         // generating rdd key as first two letters of firstname , value as firstname
         (firstname.substring(0, 2): String, firstname: String)
@@ -136,20 +131,38 @@ object SparkKafkaConsumer extends Serializable {
         // aggregation results stored to cassandra
         rdd.saveToCassandra(database, tableAggEvent, SomeColumns("event_timestamp", "count", "names")))
   }
+
+  def getAvroSchema(msg: Array[Byte]):GenericRecord={
+   try
+     GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer1)).invert(msg).get
+   catch {
+      case e: Exception =>{
+		GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer2)).invert(msg).get
+		}
+	}
+  }
   /*
   * used to generate avrorecord from kafka msg
   * @param  msg:Array[Byte]
   * @return GenericRecord
   * */
-  def getRecord(msg: Array[Byte]): GenericRecord = {
-    try
-      GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer1)).invert(msg).get
-    catch {
+  def parseMessage(msg: Array[Byte]): Event = {
+    try{
+      processMessage(false,GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer1)).invert(msg).get)
+    }catch {
       case e: Exception => {
-        GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer2)).invert(msg).get
+        processMessage(true,GenericAvroCodecs.toBinary(new Schema.Parser().parse(avroSchemaVer2)).invert(msg).get)
       }
     }
   }
+  
+  def processMessage(hasAddress:Boolean,record: GenericRecord):Event={
+     var address:String="N/A"
+     if(hasAddress)
+       address=record.get("address").toString
+     Event(System.currentTimeMillis / 1000, record.get("firstname").toString, record.get("lastname").toString, record.get("phonenumber").toString.toLong,address)
+  }	
+  
 
   /*
   * method used to write headers to our output csv file
